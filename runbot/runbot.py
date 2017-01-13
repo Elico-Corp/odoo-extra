@@ -158,7 +158,9 @@ def fqdn():
 def local_pgadmin_cursor():
     cnx = None
     try:
-        cnx = psycopg2.connect("dbname=postgres")
+        #cnx = psycopg2.connect("dbname=postgres")
+        # [SM-160623] Add db_host, db_port, db_user and db_password since the ones passed as ENV variables are not used by psycopg2
+        cnx = psycopg2.connect(database="postgres", host=config['db_host'], port=config['db_port'], user=config['db_user'], password=config['db_password'])
         cnx.autocommit = True # required for admin commands
         yield cnx.cursor()
     finally:
@@ -884,6 +886,15 @@ class runbot_build(osv.osv):
                 if config['db_host'] and grep(build.server('sql_db.py'), 'allow_uri'):
                     logdb = 'postgres://{cfg[db_user]}:{cfg[db_password]}@{cfg[db_host]}/{db}'.format(cfg=config, db=cr.dbname)
                 cmd += ["--log-db=%s" % logdb]
+
+            # [SM-160623] Add db_host, db_port, db_user and db_password since the ones passed as ENV variables are not used by psycopg2
+            cmd += ["--db_host=%s" % config['db_host']]
+            cmd += ["--db_port=%s" % config['db_port']]
+            cmd += ["--db_user=%s" % config['db_user']]
+            cmd += ["--db_password=%s" % config['db_password']]
+
+            # [SM-160623] Add db_maxconn in order to limit the connections of each instance
+            cmd += ["--db_maxconn=16"]
 
             if grep(build.server("tools/config.py"), "data-dir"):
                 datadir = build.path('datadir')
