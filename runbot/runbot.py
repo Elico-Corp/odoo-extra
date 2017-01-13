@@ -243,7 +243,7 @@ class runbot_repo(osv.osv):
         for repo in self.browse(cr, uid, ids, context=context):
             _logger.debug('checkout %s %s %s', repo.name, treeish, dest)
             p1 = subprocess.Popen(['git', '--git-dir=%s' % repo.path, 'archive', treeish], stdout=subprocess.PIPE)
-            p2 = subprocess.Popen(['tar', '-xC', dest], stdin=p1.stdout, stdout=subprocess.PIPE)
+            p2 = subprocess.Popen(['tar', '-xmC', dest], stdin=p1.stdout, stdout=subprocess.PIPE)
             p1.stdout.close()  # Allow p1 to receive a SIGPIPE if p2 exits.
             p2.communicate()[0]
 
@@ -309,11 +309,18 @@ class runbot_repo(osv.osv):
 
         refs = [[decode_utf(field) for field in line.split('\x00')] for line in git_refs.split('\n')]
 
+        cr.execute("""
+            WITH t (branch) AS (SELECT unnest(%s))
+          SELECT t.branch, b.id
+            FROM t LEFT JOIN runbot_branch b ON (b.name = t.branch)
+           WHERE b.repo_id = %s;
+        """, ([r[0] for r in refs], repo.id))
+        ref_branches = {r[0]: r[1] for r in cr.fetchall()}
+
         for name, sha, date, author, author_email, subject, committer, committer_email in refs:
             # create or get branch
-            branch_ids = Branch.search(cr, uid, [('repo_id', '=', repo.id), ('name', '=', name)])
-            if branch_ids:
-                branch_id = branch_ids[0]
+            if ref_branches.get(name):
+                branch_id = ref_branches[name]
             else:
                 _logger.debug('repo %s found new branch %s', repo.name, name)
                 branch_id = Branch.create(cr, uid, {'repo_id': repo.id, 'name': name})
@@ -798,7 +805,8 @@ class runbot_build(osv.osv):
                 if build.repo_id.modules_auto == 'repo':
                     modules_to_test += [
                         os.path.basename(os.path.dirname(a))
-                        for a in glob.glob(build.path('*/__openerp__.py'))
+                        for a in (glob.glob(build.path('*/__openerp__.py')) +
+                                  glob.glob(build.path('*/__manifest__.py')))
                     ]
                     _logger.debug("local modules_to_test for build %s: %s", build.dest, modules_to_test)
 
@@ -817,7 +825,8 @@ class runbot_build(osv.osv):
                 # Finally mark all addons to move to openerp/addons
                 modules_to_move += [
                     os.path.dirname(module)
-                    for module in glob.glob(build.path('*/__openerp__.py'))
+                    for module in (glob.glob(build.path('*/__openerp__.py')) +
+                                   glob.glob(build.path('*/__manifest__.py')))
                 ]
 
             # move all addons to server addons path
@@ -833,7 +842,8 @@ class runbot_build(osv.osv):
 
             available_modules = [
                 os.path.basename(os.path.dirname(a))
-                for a in glob.glob(build.server('addons/*/__openerp__.py'))
+                for a in (glob.glob(build.server('addons/*/__openerp__.py')) +
+                          glob.glob(build.server('addons/*/__manifest__.py')))
             ]
             if build.repo_id.modules_auto == 'all' or (build.repo_id.modules_auto != 'none' and has_server):
                 modules_to_test += available_modules
@@ -861,14 +871,15 @@ class runbot_build(osv.osv):
     def cmd(self, cr, uid, ids, context=None):
         """Return a list describing the command to start the build"""
         for build in self.browse(cr, uid, ids, context=context):
-            # Server
-            server_path = build.path("openerp-server")
-            # for 7.0
-            if not os.path.isfile(server_path):
-                server_path = build.path("openerp-server.py")
-            # for 6.0 branches
-            if not os.path.isfile(server_path):
-                server_path = build.path("bin/openerp-server.py")
+            bins = [
+                'odoo-bin',                 # >= 10.0
+                'openerp-server',           # 9.0, 8.0
+                'openerp-server.py',        # 7.0
+                'bin/openerp-server.py',    # < 7.0
+            ]
+            for server_path in map(build.path, bins):
+                if os.path.isfile(server_path):
+                    break
 
             # commandline
             cmd = [
@@ -1084,7 +1095,6 @@ class runbot_build(osv.osv):
                     'job_end': False,
                 }
                 build.write(values)
-                cr.commit()
             else:
                 # check if current job is finished
                 lock_path = build.path('logs', '%s.lock' % build.job)
@@ -1172,6 +1182,23 @@ class runbot_build(osv.osv):
             path = os.path.join(build_dir, b)
             if b not in actives and os.path.isdir(path):
                 shutil.rmtree(path)
+        
+        # cleanup old unused databases
+        cr.execute("select id from runbot_build where state in ('testing', 'running')")
+        db_ids = [id[0] for id in cr.fetchall()]
+        if db_ids:
+            with local_pgadmin_cursor() as local_cr:
+                local_cr.execute("""
+                    SELECT datname
+                      FROM pg_database
+                     WHERE pg_get_userbyid(datdba) = current_user
+                       AND datname ~ '^[0-9]+-.*'
+                       AND SUBSTRING(datname, '^([0-9]+)-.*')::int not in %s
+                           
+                """, [tuple(db_ids)])
+                to_delete = local_cr.fetchall()
+            for db, in to_delete:
+                self._local_pg_dropdb(cr, uid, db)
 
     def kill(self, cr, uid, ids, result=None, context=None):
         for build in self.browse(cr, uid, ids, context=context):
@@ -1418,6 +1445,7 @@ class RunbotController(http.Controller):
             'port': real_build.port,
             'subject': build.subject,
             'server_match': real_build.server_match,
+            'duplicate_of': build.duplicate_id if build.state == 'duplicate' else False,
         }
 
     @http.route(['/runbot/build/<build_id>'], type='http', auth="public", website=True)
@@ -1566,8 +1594,14 @@ class RunbotController(http.Controller):
             if last_build.state != 'running':
                 url = "/runbot/build/%s?ask_rebuild=1" % last_build.id
             else:
-                url = ("http://%s/login?db=%s-all&login=admin&key=admin%s" %
-                       (last_build.domain, last_build.dest, "&redirect=/web?debug=1" if not build.branch_id.branch_name.startswith('7.0') else ''))
+                branch = build.branch_id.branch_name
+                if branch.startswith('7'):
+                    base_url = "http://%s/login?db=%s-all&login=admin&key=admin"
+                elif branch.startswith('8'):
+                    base_url = "http://%s/login?db=%s-all&login=admin&key=admin&redirect=/web?debug=1"
+                else:
+                    base_url = "http://%s/web/login?db=%s-all&login=admin&redirect=/web?debug=1"
+                url = base_url % (last_build.domain, last_build.dest)
         else:
             return request.not_found()
         return werkzeug.utils.redirect(url)
