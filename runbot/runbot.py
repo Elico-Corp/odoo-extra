@@ -241,7 +241,7 @@ class runbot_repo(osv.osv):
         """Execute git command cmd"""
         for repo in self.browse(cr, uid, ids, context=context):
             cmd = ['git', '--git-dir=%s' % repo.path] + cmd
-            _logger.info("git: %s", ' '.join(cmd))
+            _logger.debug("git: %s", ' '.join(cmd))
             return subprocess.check_output(cmd)
 
     def _git_export(self, cr, uid, ids, treeish, dest, context=None):
@@ -280,11 +280,10 @@ class runbot_repo(osv.osv):
 
     def _update(self, cr, uid, ids, context=None):
         for repo in self.browse(cr, uid, ids, context=context):
-            repo_name = repo.name
             try:
-                self._update_git(cr, uid, repo)
-            except Exception:
-                _logger.exception('Fail to update repo %s', repo_name)
+                self.update_git(cr, uid, repo)
+            except subprocess.CalledProcessError:
+                _logger.exception('Ignored git error while updating repo %s', repo.name)
 
     def _update_git(self, cr, uid, repo, context=None):
         _logger.debug('repo %s updating branches', repo.name)
@@ -295,7 +294,11 @@ class runbot_repo(osv.osv):
         if not os.path.isdir(os.path.join(repo.path)):
             os.makedirs(repo.path)
         if not os.path.isdir(os.path.join(repo.path, 'refs')):
-            run(['git', 'clone', '--bare', repo.name, repo.path])
+            if repo.name.startswith('https://') or repo.name.startswith('git@'):
+                repo_name = repo.name
+            else:
+                repo_name = 'https://' + repo.name
+            run(['git', 'clone', '--bare', repo_name, repo.path])
 
         # check for mode == hook
         fname_fetch_head = os.path.join(repo.path, 'FETCH_HEAD')
@@ -316,6 +319,10 @@ class runbot_repo(osv.osv):
         git_refs = git_refs.strip()
 
         refs = [[decode_utf(field) for field in line.split('\x00')] for line in git_refs.split('\n')]
+        refs = [ref for ref in refs if len(ref) == 8]  # cleanup empty lines which cause unpack errors below
+        if not refs:
+            _logger.error('no refs for repo %s [%d]', repo.name, repo.id)
+            return
 
         cr.execute("""
             WITH t (branch) AS (SELECT unnest(%s))
@@ -373,7 +380,7 @@ class runbot_repo(osv.osv):
         workers = int(icp.get_param(cr, uid, 'runbot.workers', default=6))
         running_max = int(icp.get_param(cr, uid, 'runbot.running_max', default=75))
         host = fqdn()
-
+        _logger.debug('in scheduler %s', ids)
         Build = self.pool['runbot.build']
         domain = [('repo_id', 'in', ids)]
         domain_host = domain + [('host', '=', host)]
@@ -385,7 +392,7 @@ class runbot_repo(osv.osv):
         # launch new tests
         testing = Build.search_count(cr, uid, domain_host + [('state', '=', 'testing')])
         pending = Build.search_count(cr, uid, domain + [('state', '=', 'pending')])
-
+        _logger.debug('testing: %d, workers: %d, pending: %d (domain: %s)', testing, workers, pending, domain)
         while testing < workers and pending > 0:
 
             # find sticky pending build if any, otherwise, last pending (by id, not by sequence) will do the job
@@ -399,6 +406,7 @@ class runbot_repo(osv.osv):
             # compute the number of testing and pending jobs again
             testing = Build.search_count(cr, uid, domain_host + [('state', '=', 'testing')])
             pending = Build.search_count(cr, uid, domain + [('state', '=', 'pending')])
+            _logger.debug('testing: %d, workers: %d, pending: %d', testing, workers, pending)
 
         # terminate and reap doomed build
         build_ids = Build.search(cr, uid, domain_host + [('state', '=', 'running')])
@@ -413,8 +421,12 @@ class runbot_repo(osv.osv):
         build_ids = sticky.values()
         build_ids += non_sticky
         # terminate extra running builds
-        Build._kill(cr, uid, build_ids[running_max:])
-        Build._reap(cr, uid, build_ids)
+        t0 = time.time()
+        Build.kill(cr, uid, build_ids[running_max:])
+        t1= time.time()
+        _logger.info('Build.kill: %.2fs', t1-t0)
+        Build.reap(cr, uid, build_ids)
+        _logger.info('Build.reap: %.2fs', time.time()-t1)
 
     def _reload_nginx(self, cr, uid, context=None):
         settings = {}
@@ -437,22 +449,28 @@ class runbot_repo(osv.osv):
                 os.kill(pid, signal.SIGHUP)
             except Exception:
                 _logger.debug('start nginx')
-                if run(['/usr/sbin/nginx', '-p', nginx_dir, '-c', 'nginx.conf']):
-                    # obscure nginx bug leaving orphan worker listening on nginx port
-                    if not run(['pkill', '-f', '-P1', 'nginx: worker']):
-                        _logger.debug('failed to start nginx - orphan worker killed, retrying')
-                        run(['/usr/sbin/nginx', '-p', nginx_dir, '-c', 'nginx.conf'])
-                    else:
-                        _logger.debug('failed to start nginx - failed to kill orphan worker - oh well')
+                run(['sudo', '/usr/sbin/nginx', '-p', nginx_dir, '-c', 'nginx.conf'])
 
     def killall(self, cr, uid, ids=None, context=None):
         return
 
     def _cron(self, cr, uid, ids=None, context=None):
         ids = self.search(cr, uid, [('mode', '!=', 'disabled')], context=context)
+        _logger.info('cron start')
+        t0 = time.time()
+        ids = self.search(cr, uid, [('mode', '!=', 'disabled')], context=context)
+        t1 = time.time()
+        _logger.info('cron search lasted %.2fs', t1-t0)
         self._update(cr, uid, ids, context=context)
+        t2 = time.time()
+        _logger.info('cron update lasted %.2fs', t2-t1)
         self._scheduler(cr, uid, ids, context=context)
+        t3 = time.time()
+        _logger.info('cron scheduler lasted %.2fs', t3-t2)
         self._reload_nginx(cr, uid, context=context)
+        t4 = time.time()
+        _logger.info('cron reload nginx lasted %.2fs', t4-t3)
+        _logger.info('cron end, lasted %.2fs', t4-t0)
 
     # backwards compatibility
     def cron(self, cr, uid, ids=None, context=None):
@@ -524,6 +542,10 @@ class runbot_branch(osv.osv):
         assert len(ids) == 1
         branch = self.browse(cr, uid, ids[0], context=context)
         repo = branch.repo_id
+        if repo.name.startswith('https://') or repo.name.startswith('git@'):
+            repo_name = repo.name
+        else:
+            repo_name = 'https://' + repo.name
         try:
             repo._git(['ls-remote', '-q', '--exit-code', repo.name, branch.name])
         except subprocess.CalledProcessError:
@@ -880,6 +902,8 @@ class runbot_build(osv.osv):
                     for module in (glob.glob(build._path('*/__openerp__.py')) +
                                    glob.glob(build._path('*/__manifest__.py')))
                 ]
+            else:
+                is_server = True
 
             # move all addons to server addons path
             for module in uniq_list(glob.glob(build._path('addons/*')) + modules_to_move):
@@ -893,9 +917,8 @@ class runbot_build(osv.osv):
                     if os.path.islink(addon_path) or os.path.isfile(addon_path):
                         os.remove(addon_path)
                     else:
-                        shutil.rmtree(addon_path)
+                        shutil.rmtree(build.server('addons', basename))
                 shutil.move(module, build._server('addons'))
-
             available_modules = [
                 os.path.basename(os.path.dirname(a))
                 for a in (glob.glob(build._server('addons/*/__openerp__.py')) +
@@ -1087,7 +1110,7 @@ class runbot_build(osv.osv):
 
         # run server
         cmd, mods = build._cmd()
-        if os.path.exists(build._server('addons/im_livechat')):
+        if False and os.path.exists(build._server('addons/im_livechat')):
             cmd += ["--workers", "2"]
             cmd += ["--longpolling-port", "%d" % (build.port + 1)]
             cmd += ["--max-cron-threads", "1"]
@@ -1102,7 +1125,7 @@ class runbot_build(osv.osv):
                 cmd += ['--db-filter','%d.*$']
             else:
                 cmd += ['--db-filter','%s.*$' % build.dest]
-
+        cmd += ['--db_maxconn', '8']
         ## Web60
         #self.client_web_path=os.path.join(self.running_path,"client-web")
         #self.client_web_bin_path=os.path.join(self.client_web_path,"openerp-web.py")
@@ -1162,6 +1185,8 @@ class runbot_build(osv.osv):
         default_timeout = int(icp.get_param(cr, uid, 'runbot.timeout', default=1800)) / 60
 
         for build in self.browse(cr, uid, ids, context=context):
+            t0 = time.time()
+            _logger.info('Build.schedule %s state %s', build.dest, build.state)
             if build.state == 'deathrow':
                 build._kill(result='manually_killed')
                 continue
@@ -1205,11 +1230,13 @@ class runbot_build(osv.osv):
                     v['job'] = jobs[jobs.index(build.job) + 1]
                 build.write(v)
             build.refresh()
+            _logger.info('Build.schedule %s new state %s', build.dest, build.state)
 
             # run job
             pid = None
             if build.state != 'done':
                 build._logger('running %s', build.job)
+                t1 = time.time()
                 job_method = getattr(self, '_' + build.job)
                 mkdirs([build._path('logs')])
                 lock_path = build._path('logs', '%s.lock' % build.job)
@@ -1217,6 +1244,8 @@ class runbot_build(osv.osv):
                 try:
                     pid = job_method(cr, uid, build, lock_path, log_path)
                     build.write({'pid': pid})
+                    t2 = time.time()
+                    _logger.info('Build.schedule  %s %.2fs', build.job, t2-t1)
                 except Exception:
                     _logger.exception('%s failed running method %s', build.dest, build.job)
                     build._log(build.job, "failed running job method, see runbot log")
@@ -1232,7 +1261,11 @@ class runbot_build(osv.osv):
 
             # cleanup only needed if it was not killed
             if build.state == 'done':
+                t3 = time.time()
                 build._local_cleanup()
+                _logger.info('Build.cleanup: %.2fs', time.time() - t3)
+            _logger.info('end Build.schedule %s state %s lasted %.2fs', build.dest, build.state, time.time()-t0)
+
 
     def _skip(self, cr, uid, ids, context=None):
         self.write(cr, uid, ids, {'state': 'done', 'result': 'skipped'}, context=context)
@@ -1258,6 +1291,8 @@ class runbot_build(osv.osv):
         root = self.pool['runbot.repo']._root(cr, uid)
         build_dir = os.path.join(root, 'build')
         builds = os.listdir(build_dir)
+        if not builds:
+            return
         cr.execute("""
             SELECT dest
               FROM runbot_build
@@ -1463,9 +1498,14 @@ class RunbotController(http.Controller):
             build_dict = {build.id: build for build in build_obj.browse(cr, uid, build_ids, context=request.context) }
 
             def branch_info(branch):
+                _logger.debug('branch_info for %d: %d builds', branch.id, len(build_by_branch_ids.get(branch.id, [])))
                 return {
                     'branch': branch,
-                    'builds': [self.build_info(build_dict[build_id]) for build_id in build_by_branch_ids[branch.id]]
+                    'builds': [
+                        self.build_info(build_dict[build_id])
+                        for build_id in build_by_branch_ids.get(branch.id, [])
+                        if build_id in build_dict
+                    ]
                 }
 
             context.update({
