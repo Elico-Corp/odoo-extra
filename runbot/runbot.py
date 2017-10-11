@@ -379,7 +379,7 @@ class runbot_repo(osv.osv):
         domain_host = domain + [('host', '=', host)]
 
         # schedule jobs (transitions testing -> running, kill jobs, ...)
-        build_ids = Build.search(cr, uid, domain_host + [('state', 'in', ['testing', 'running'])])
+        build_ids = Build.search(cr, uid, domain_host + [('state', 'in', ['testing', 'running', 'deathrow'])])
         Build._schedule(cr, uid, build_ids)
 
         # launch new tests
@@ -575,6 +575,21 @@ class runbot_build(osv.osv):
                 result[build.id] = "%s:%s" % (domain, build.port)
         return result
 
+    def _guess_result(self, cr, uid, ids, field_nae, arg, context=None):
+        cr.execute("""
+            SELECT b.id,
+                   CASE WHEN b.state != 'testing' THEN b.result
+                        WHEN array_agg(l.level)::text[] && ARRAY['ERROR', 'CRITICAL'] THEN 'ko'
+                        WHEN array_agg(l.level)::text[] && ARRAY['WARNING'] THEN 'warn'
+                        ELSE 'ok'
+                    END
+              FROM runbot_build b
+         LEFT JOIN ir_logging l ON (l.build_id = b.id AND l.level != 'INFO')
+             WHERE b.id IN %s
+          GROUP BY b.id
+        """, [tuple(ids)])
+        return dict(cr.fetchall())
+
     _columns = {
         'branch_id': fields.many2one('runbot.branch', 'Branch', required=True, ondelete='cascade', select=1),
         'repo_id': fields.related(
@@ -602,9 +617,10 @@ class runbot_build(osv.osv):
         'subject': fields.text('Subject'),
         'sequence': fields.integer('Sequence', select=1),
         'modules': fields.char("Modules to Install"),
-        'result': fields.char('Result'), # ok, ko, warn, skipped, killed
+        'result': fields.char('Result'), # ok, ko, warn, skipped, killed, manually_killed
+        'guess_result': fields.function(_guess_result, type='char'),
         'pid': fields.integer('Pid'),
-        'state': fields.char('Status'), # pending, testing, running, done, duplicate
+        'state': fields.char('Status'), # pending, testing, running, done, duplicate, deathrow
         'job': fields.char('Job'), # job_*
         'job_start': fields.datetime('Job start'),
         'job_end': fields.datetime('Job end'),
@@ -923,8 +939,7 @@ class runbot_build(osv.osv):
 
             # commandline
             cmd = [
-                sys.executable,
-                server_path,
+                build._path(server_path),
                 "--xmlrpc-port=%d" % build.port,
             ]
             # options
@@ -1034,7 +1049,7 @@ class runbot_build(osv.osv):
             ]
             bad_modules = set(available_modules) - set((mods or '').split(','))
             omit = ['--omit', ','.join(build._server('addons', m) for m in bad_modules)] if bad_modules else []
-            cmd = ['coverage', 'run', '--branch', '--source', build._server()] + omit + cmd[1:]
+            cmd = ['coverage', 'run', '--branch', '--source', build._server()] + omit + cmd[:]
         # reset job_start to an accurate job_20 job_time
         build.write({'job_start': now()})
         return self._spawn(cmd, lock_path, log_path, cpu_limit=2100, env=env)
@@ -1113,11 +1128,12 @@ class runbot_build(osv.osv):
                 sequence = self.search(cr, uid, [], order='id desc', limit=1)[0]
 
             # Force it now
+            rebuild = True
             if build.state == 'done' and build.result == 'skipped':
-                values = {'state': 'pending', 'sequence':sequence, 'result': ''}
+                values = {'state': 'pending', 'sequence': sequence, 'result': ''}
                 self.write(cr, SUPERUSER_ID, [build.id], values, context=context)
             # or duplicate it
-            elif build.state in ['running', 'done', 'duplicate']:
+            elif build.state in ['running', 'done', 'duplicate', 'deathrow']:
                 new_build = {
                     'sequence': sequence,
                     'branch_id': build.branch_id.id,
@@ -1131,8 +1147,11 @@ class runbot_build(osv.osv):
                 }
                 new_build_id = self.create(cr, SUPERUSER_ID, new_build, context=context)
                 build = self.browse(cr, uid, new_build_id, context=context)
-            user = self.pool['res.users'].browse(cr, uid, uid, context=context)
-            build._log('rebuild', 'Rebuild initiated by %s' % user.name)
+            else:
+                rebuild = False
+            if rebuild:
+                user = self.pool['res.users'].browse(cr, uid, uid, context=context)
+                build._log('rebuild', 'Rebuild initiated by %s' % user.name)
             return build.repo_id.id
 
     def _schedule(self, cr, uid, ids, context=None):
@@ -1143,7 +1162,10 @@ class runbot_build(osv.osv):
         default_timeout = int(icp.get_param(cr, uid, 'runbot.timeout', default=1800)) / 60
 
         for build in self.browse(cr, uid, ids, context=context):
-            if build.state == 'pending':
+            if build.state == 'deathrow':
+                build._kill(result='manually_killed')
+                continue
+            elif build.state == 'pending':
                 # allocate port and schedule first job
                 port = self._find_port(cr, uid)
                 values = {
@@ -1286,6 +1308,16 @@ class runbot_build(osv.osv):
             build._github_status()
             build._local_cleanup()
 
+    def _ask_kill(self, cr, uid, ids, context=None):
+        user = self.pool['res.users'].browse(cr, SUPERUSER_ID, uid, context=context)
+        for build in self.browse(cr, SUPERUSER_ID, ids, context=context):
+            if build.state == 'pending':
+                build._skip()
+                build._log('_ask_kill', 'Skipping build %s, requested by %s (user #%s)' % (build.dest, user.name, uid))
+            elif build.state in ['testing', 'running']:
+                build.write({'state': 'deathrow'})
+                build._log('_ask_kill', 'Killing build %s, requested by %s (user #%s)' % (build.dest, user.name, uid))
+
     def _reap(self, cr, uid, ids):
         while True:
             try:
@@ -1316,9 +1348,35 @@ class runbot_event(osv.osv):
 
     TYPES = [(t, t.capitalize()) for t in 'client server runbot'.split()]
     _columns = {
-        'build_id': fields.many2one('runbot.build', 'Build'),
+        'build_id': fields.many2one('runbot.build', 'Build', select=True, ondelete='cascade'),
         'type': fields.selection(TYPES, string='Type', required=True, select=True),
     }
+
+    def init(self, cr):
+        super(runbot_event, self).init(cr)
+        cr.execute("""
+CREATE OR REPLACE FUNCTION runbot_set_logging_build() RETURNS TRIGGER AS $$
+BEGIN
+  IF (new.build_id IS NULL AND new.dbname IS NOT NULL AND new.dbname != current_database()) THEN
+    UPDATE ir_logging l
+       SET build_id = split_part(new.dbname, '-', 1)::integer
+     WHERE l.id = new.id;
+  END IF;
+RETURN NULL;
+END;
+$$ language plpgsql;
+
+DO $$
+BEGIN
+    CREATE TRIGGER runbot_new_logging
+    AFTER INSERT ON ir_logging
+    FOR EACH ROW
+    EXECUTE PROCEDURE runbot_set_logging_build();
+EXCEPTION
+    WHEN duplicate_object THEN
+END;
+$$;
+        """)
 
 #----------------------------------------------------------
 # Runbot Controller
@@ -1353,7 +1411,7 @@ class RunbotController(http.Controller):
 
         build_ids = []
         if repo:
-            filters = {key: post.get(key, '1') for key in ['pending', 'testing', 'running', 'done']}
+            filters = {key: post.get(key, '1') for key in ['pending', 'testing', 'running', 'done', 'deathrow']}
             domain = [('repo_id','=',repo.id)]
             domain += [('state', '!=', key) for key, value in filters.iteritems() if value == '0']
             if search:
@@ -1503,6 +1561,7 @@ class RunbotController(http.Controller):
             'name': build.name,
             'state': real_build.state,
             'result': real_build.result,
+            'guess_result': real_build.guess_result,
             'subject': build.subject,
             'author': build.author,
             'committer': build.committer,
@@ -1514,20 +1573,19 @@ class RunbotController(http.Controller):
             'domain': real_build.domain,
             'host': real_build.host,
             'port': real_build.port,
-            'subject': build.subject,
             'server_match': real_build.server_match,
             'duplicate_of': build.duplicate_id if build.state == 'duplicate' else False,
             'coverage': build.branch_id.coverage,
         }
 
-    @http.route(['/runbot/build/<build_id>'], type='http', auth="public", website=True)
-    def build(self, build_id=None, search=None, **post):
+    @http.route(['/runbot/build/<int:build_id>'], type='http', auth="public", website=True)
+    def build(self, build_id, search=None, **post):
         registry, cr, uid, context = request.registry, request.cr, request.uid, request.context
 
         Build = registry['runbot.build']
         Logging = registry['ir.logging']
 
-        build = Build.browse(cr, uid, [int(build_id)])[0]
+        build = Build.browse(cr, uid, [build_id])[0]
         if not build.exists():
             return request.not_found()
 
@@ -1537,13 +1595,13 @@ class RunbotController(http.Controller):
         build_ids = Build.search(cr, uid, [('branch_id', '=', build.branch_id.id)])
         other_builds = Build.browse(cr, uid, build_ids)
 
-        domain = ['|', ('dbname', '=like', '%s-%%' % real_build.dest), ('build_id', '=', real_build.id)]
+        domain = [('build_id', '=', real_build.id)]
         #if type:
         #    domain.append(('type', '=', type))
         #if level:
         #    domain.append(('level', '=', level))
         if search:
-            domain.append(('name', 'ilike', search))
+            domain.append(('message', 'ilike', search))
         logging_ids = Logging.search(cr, SUPERUSER_ID, domain)
 
         context = {
@@ -1557,11 +1615,18 @@ class RunbotController(http.Controller):
         #context['level'] = level
         return request.render("runbot.build", context)
 
-    @http.route(['/runbot/build/<build_id>/force'], type='http', auth="public", methods=['POST'], csrf=False)
-    def build_force(self, build_id, **post):
-        registry, cr, uid, context = request.registry, request.cr, request.uid, request.context
-        repo_id = registry['runbot.build']._force(cr, uid, [int(build_id)])
-        return werkzeug.utils.redirect('/runbot/repo/%s' % repo_id)
+    @http.route(['/runbot/build/<int:build_id>/force'], type='http', auth="public", methods=['POST'], csrf=False)
+    def build_force(self, build_id, search=None, **post):
+        registry, cr, uid = request.registry, request.cr, request.uid
+        repo_id = registry['runbot.build']._force(cr, uid, [build_id])
+        return werkzeug.utils.redirect('/runbot/repo/%s' % repo_id + ('?search=%s' % search if search else ''))
+
+    @http.route(['/runbot/build/<int:build_id>/kill'], type='http', auth="user", methods=['POST'], csrf=False)
+    def build_ask_kill(self, build_id, search=None, **post):
+        registry, cr, uid = request.registry, request.cr, request.uid
+        build = registry['runbot.build'].browse(cr, uid, build_id)
+        build._ask_kill()
+        return werkzeug.utils.redirect('/runbot/repo/%s' % build.repo_id.id + ('?search=%s' % search if search else ''))
 
     @http.route([
         '/runbot/badge/<int:repo_id>/<branch>.svg',
@@ -1573,7 +1638,7 @@ class RunbotController(http.Controller):
                   ('branch_id.branch_name', '=', branch),
                   ('branch_id.sticky', '=', True),
                   ('state', 'in', ['testing', 'running', 'done']),
-                  ('result', '!=', 'skipped'),
+                  ('result', 'not in', ['skipped', 'manually_killed']),
                   ]
 
         last_update = '__last_update'
